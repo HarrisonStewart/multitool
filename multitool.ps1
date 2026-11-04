@@ -1,11 +1,12 @@
 param (
     [Parameter(Position = 0)]
-    [string]$Username
+    [string]$Username,
+    [string]$ComputerName
 )
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Setup
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
     Write-Host "The Active Directory module is not installed. Install RSAT with:" -ForegroundColor Red
@@ -15,13 +16,17 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 Import-Module ActiveDirectory
 
-# All reads and writes go to the PDC Emulator, which always has current lockout data
+# All AD reads and writes go to the PDC Emulator, which always has current lockout data
 try {
     $script:DC = (Get-ADDomain -ErrorAction Stop).PDCEmulator
 } catch {
     Write-Host "Could not contact the domain: $($_.Exception.Message)" -ForegroundColor Red
     return
 }
+
+$script:SelectedUser     = $null
+$script:SelectedComputer = $null
+$script:HKLM             = [uint32]2147483650
 
 $script:UserProps = @(
     'DisplayName', 'Mail', 'Enabled', 'LockedOut', 'AccountLockoutTime',
@@ -30,9 +35,14 @@ $script:UserProps = @(
     'LastLogonDate', 'AccountExpirationDate'
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+$script:ComputerProps = @(
+    'Description', 'OperatingSystem', 'OperatingSystemVersion',
+    'LastLogonDate', 'IPv4Address', 'CanonicalName'
+)
+
+# ===========================================================================
+# Shared helpers
+# ===========================================================================
 
 function Read-YesNo {
     param(
@@ -47,6 +57,30 @@ function Read-YesNo {
         if ($answer -in 'n', 'no')     { return $false }
     }
 }
+
+function Write-Row {
+    param(
+        [string]$Label,
+        $Value,
+        [string]$Color
+    )
+    $text = "{0,-24}{1}" -f "$($Label):", $Value
+    if ($Color) { Write-Host $text -ForegroundColor $Color } else { Write-Host $text }
+}
+
+function Write-Section {
+    param([string]$Title)
+    Write-Host "`n--- $Title ---" -ForegroundColor Cyan
+}
+
+function Format-Date {
+    param($Date)
+    if ($Date) { ([datetime]$Date).ToString('dd-MMM-yyyy hh:mm tt') } else { '' }
+}
+
+# ===========================================================================
+# User functions
+# ===========================================================================
 
 function New-TempPassword {
     param([int]$Length = 12)
@@ -75,10 +109,6 @@ function Get-PasswordExpiryText {
     if ($raw -eq 9223372036854775807)     { return 'Never expires' }
     return [datetime]::FromFileTime($raw).ToString('dd-MMM-yyyy hh:mm tt')
 }
-
-# ---------------------------------------------------------------------------
-# Core functions
-# ---------------------------------------------------------------------------
 
 function Find-HelpdeskUser {
     # Accepts sAMAccountName, UPN, or email address. Returns the user or $null.
@@ -136,9 +166,7 @@ function Show-HelpdeskUserStatus {
     }
 
     Write-Host "`n------------------------------------------------"
-    foreach ($key in $rows.Keys) {
-        Write-Host ("{0,-22}{1}" -f "$($key):", $rows[$key])
-    }
+    foreach ($key in $rows.Keys) { Write-Row $key $rows[$key] }
     Write-Host "------------------------------------------------"
 
     # Flag conditions an unlock or reset won't fix
@@ -244,54 +272,321 @@ function Reset-HelpdeskPassword {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Machine functions
+# ===========================================================================
 
-$selectedUser = $null
+function New-HelpdeskCimSession {
+    # Try WinRM first; fall back to DCOM if WinRM isn't enabled on the target
+    param([string]$ComputerName)
+    try {
+        return New-CimSession -ComputerName $ComputerName -OperationTimeoutSec 15 -ErrorAction Stop
+    } catch {
+        try {
+            $dcom = New-CimSessionOption -Protocol Dcom
+            return New-CimSession -ComputerName $ComputerName -SessionOption $dcom -OperationTimeoutSec 15 -ErrorAction Stop
+        } catch {
+            Write-Host "Could not connect to $ComputerName : $($_.Exception.Message)" -ForegroundColor Red
+            return $null
+        }
+    }
+}
 
+function Get-OptionalCim {
+    # Returns $null instead of failing, so one bad class doesn't stop the whole report
+    param(
+        $Session,
+        [string]$ClassName,
+        [string]$Filter,
+        [string]$Namespace = 'root/cimv2'
+    )
+    $params = @{ CimSession = $Session; ClassName = $ClassName; Namespace = $Namespace; ErrorAction = 'Stop' }
+    if ($Filter) { $params.Filter = $Filter }
+    try { Get-CimInstance @params } catch { $null }
+}
+
+function Get-RemoteRegValue {
+    param(
+        $Session,
+        [string]$Key,
+        [string]$Name,
+        [switch]$Dword
+    )
+    $method = if ($Dword) { 'GetDWORDValue' } else { 'GetStringValue' }
+    try {
+        $r = Invoke-CimMethod -CimSession $Session -Namespace root/default -ClassName StdRegProv -MethodName $method `
+                -Arguments @{ hDefKey = $script:HKLM; sSubKeyName = $Key; sValueName = $Name } -ErrorAction Stop
+        if ($Dword) { $r.uValue } else { $r.sValue }
+    } catch { $null }
+}
+
+function Test-RemoteRegKey {
+    param(
+        $Session,
+        [string]$ParentKey,
+        [string]$ChildName
+    )
+    try {
+        $r = Invoke-CimMethod -CimSession $Session -Namespace root/default -ClassName StdRegProv -MethodName EnumKey `
+                -Arguments @{ hDefKey = $script:HKLM; sSubKeyName = $ParentKey } -ErrorAction Stop
+        return ($r.sNames -contains $ChildName)
+    } catch { return $false }
+}
+
+function Show-HelpdeskComputerInfo {
+    # Accepts a hostname, FQDN, or IP. Returns $true if anything was found.
+    param([string]$ComputerName)
+
+    $name = $ComputerName.Trim()
+    if (-not $name) { return $false }
+
+    $parsedIp  = $null
+    $isIp      = [ipaddress]::TryParse($name, [ref]$parsedIp)
+    $shortName = if ($isIp) { $name } else { ($name -split '\.')[0] }
+
+    Write-Host "`nQuerying $name ..." -ForegroundColor Cyan
+    Write-Row 'Lookup time' (Get-Date -Format 'dd-MMM-yyyy hh:mm:ss tt')
+
+    # --- Active Directory (available even when the PC is offline) ---
+    $ad = $null
+    if (-not $isIp) {
+        try {
+            $ad = Get-ADComputer -Identity $shortName -Server $script:DC -Properties $script:ComputerProps -ErrorAction Stop
+        } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+            Write-Host "No computer named '$shortName' in Active Directory." -ForegroundColor Yellow
+        } catch {
+            Write-Host "AD lookup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    if ($ad) {
+        $ou = if ($ad.CanonicalName) { $ad.CanonicalName.Substring(0, $ad.CanonicalName.LastIndexOf('/')) } else { '' }
+        Write-Section 'Active Directory'
+        Write-Row 'Name'                 $ad.Name
+        Write-Row 'Enabled'              $ad.Enabled (& { if (-not $ad.Enabled) { 'Red' } })
+        Write-Row 'OU'                   $ou
+        Write-Row 'Description'          $ad.Description
+        Write-Row 'OS (per AD)'          "$($ad.OperatingSystem) $($ad.OperatingSystemVersion)"
+        Write-Row 'Last logon (approx)'  (Format-Date $ad.LastLogonDate)
+        Write-Row 'IPv4 (DNS)'           $ad.IPv4Address
+    }
+
+    # --- Connectivity ---
+    Write-Section 'Connectivity'
+    $pingOk = Test-Connection -ComputerName $name -Count 1 -Quiet -ErrorAction SilentlyContinue
+    Write-Row 'Ping' (& { if ($pingOk) { 'Replied' } else { 'No reply (may be offline or ICMP blocked)' } }) `
+              (& { if (-not $pingOk) { 'Yellow' } })
+
+    $session = New-HelpdeskCimSession $name
+    if (-not $session) {
+        Write-Row 'Remote query' 'Failed - live details unavailable' 'Red'
+        return [bool]$ad
+    }
+    Write-Row 'Remote query' "Connected ($($session.Protocol))" 'Green'
+
+    try {
+        $cs   = Get-OptionalCim $session 'Win32_ComputerSystem'
+        $bios = Get-OptionalCim $session 'Win32_BIOS'
+        $os   = Get-OptionalCim $session 'Win32_OperatingSystem'
+        $cpu  = Get-OptionalCim $session 'Win32_Processor' | Select-Object -First 1
+        $disks = Get-OptionalCim $session 'Win32_LogicalDisk' -Filter 'DriveType = 3'
+        $nics  = Get-OptionalCim $session 'Win32_NetworkAdapterConfiguration' -Filter 'IPEnabled = True'
+
+        # Stale DNS can point a hostname at a different PC; make that obvious
+        if (-not $isIp -and $cs -and $cs.Name -ne $shortName) {
+            Write-Host "WARNING: '$name' answered as '$($cs.Name)'. DNS may be stale - this may be a different PC." -ForegroundColor Red
+        }
+
+        # --- System ---
+        Write-Section 'System'
+        if ($cs) {
+            Write-Row 'Computer name'     $cs.Name
+            Write-Row 'Manufacturer'      $cs.Manufacturer
+            Write-Row 'Model'             $cs.Model
+            Write-Row 'RAM'               ('{0} GB' -f [math]::Round($cs.TotalPhysicalMemory / 1GB, 1))
+            Write-Row 'Logged-on user'    (& { if ($cs.UserName) { $cs.UserName } else { 'None at console' } })
+        }
+        if ($bios) {
+            Write-Row 'Serial / Service Tag' $bios.SerialNumber.Trim() 'Green'
+            $biosDate = if ($bios.ReleaseDate) { " ($(([datetime]$bios.ReleaseDate).ToString('dd-MMM-yyyy')))" } else { '' }
+            Write-Row 'BIOS version'      "$($bios.SMBIOSBIOSVersion)$biosDate"
+        }
+        if ($cpu) {
+            Write-Row 'CPU'               $cpu.Name.Trim()
+        }
+
+        # --- Operating system ---
+        Write-Section 'Operating System'
+        if ($os) {
+            $ntKey          = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+            $displayVersion = Get-RemoteRegValue $session $ntKey 'DisplayVersion'
+            $ubr            = Get-RemoteRegValue $session $ntKey 'UBR' -Dword
+            $build          = if ($null -ne $ubr) { "$($os.BuildNumber).$ubr" } else { $os.BuildNumber }
+            $uptime         = (Get-Date) - $os.LastBootUpTime
+
+            Write-Row 'OS'                $os.Caption
+            Write-Row 'Version / Build'   "$displayVersion  (build $build)"
+            Write-Row 'Installed'         (Format-Date $os.InstallDate)
+            Write-Row 'Last boot'         (Format-Date $os.LastBootUpTime)
+            Write-Row 'Uptime'            ('{0}d {1}h {2}m' -f $uptime.Days, $uptime.Hours, $uptime.Minutes) `
+                                          (& { if ($uptime.TotalDays -gt 7) { 'Yellow' } })
+        }
+
+        $rebootReasons = @()
+        if (Test-RemoteRegKey $session 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' 'RebootRequired') {
+            $rebootReasons += 'Windows Update'
+        }
+        if (Test-RemoteRegKey $session 'SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing' 'RebootPending') {
+            $rebootReasons += 'Component Servicing'
+        }
+        if ($rebootReasons) {
+            Write-Row 'Pending reboot' "Yes ($($rebootReasons -join ', '))" 'Yellow'
+        } else {
+            Write-Row 'Pending reboot' 'No'
+        }
+
+        # --- Storage ---
+        Write-Section 'Storage'
+        foreach ($d in $disks) {
+            if (-not $d.Size) { continue }
+            $freeGB = [math]::Round($d.FreeSpace / 1GB, 1)
+            $sizeGB = [math]::Round($d.Size / 1GB, 1)
+            $pct    = [math]::Round(($d.FreeSpace / $d.Size) * 100)
+            Write-Row $d.DeviceID "$freeGB GB free of $sizeGB GB ($pct% free)" (& { if ($pct -lt 10) { 'Red' } elseif ($pct -lt 20) { 'Yellow' } })
+        }
+
+        $sysDrive = if ($os) { $os.SystemDrive } else { 'C:' }
+        $bl = Get-OptionalCim $session 'Win32_EncryptableVolume' -Namespace 'root/cimv2/Security/MicrosoftVolumeEncryption' `
+                -Filter "DriveLetter = '$sysDrive'"
+        $blText = if (-not $bl)                     { 'Unavailable (needs admin rights)' }
+                  elseif ($bl.ProtectionStatus -eq 1) { 'On' }
+                  elseif ($bl.ProtectionStatus -eq 0) { 'Off' }
+                  else                                { 'Unknown' }
+        Write-Row "BitLocker ($sysDrive)" $blText (& { if ($blText -ne 'On') { 'Yellow' } })
+
+        # --- Network ---
+        Write-Section 'Network'
+        foreach ($n in $nics) {
+            $ipv4 = $n.IPAddress | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
+            Write-Host "  $($n.Description)"
+            Write-Row '    IPv4'          ($ipv4 -join ', ')
+            Write-Row '    MAC'           $n.MACAddress
+            Write-Row '    Gateway'       ($n.DefaultIPGateway -join ', ')
+            Write-Row '    DHCP'          $n.DHCPEnabled
+        }
+    } finally {
+        Remove-CimSession $session
+    }
+
+    return $true
+}
+
+# ===========================================================================
+# Menus
+# ===========================================================================
+
+function Show-UserMenu {
+    while ($true) {
+        $label = if ($script:SelectedUser) {
+            "$($script:SelectedUser.DisplayName) ($($script:SelectedUser.SamAccountName))"
+        } else { 'none' }
+
+        Write-Host ""
+        Write-Host "=== User Functions ===  Selected user: $label" -ForegroundColor Cyan
+        Write-Host "  1) Look up user"
+        Write-Host "  2) Refresh status"
+        Write-Host "  3) Unlock account"
+        Write-Host "  4) Reset password"
+        Write-Host "  B) Back"
+        $selection = Read-Host "Choose an option"
+
+        switch ($selection) {
+            '1' {
+                $lookup = Read-Host "Enter username, UPN, or email"
+                $found  = Find-HelpdeskUser $lookup
+                if ($found) {
+                    $script:SelectedUser = $found
+                    Show-HelpdeskUserStatus $script:SelectedUser
+                }
+            }
+            { $_ -in '2', '3', '4' -and -not $script:SelectedUser } {
+                Write-Host "Look up a user first (option 1)." -ForegroundColor Yellow
+                break
+            }
+            '2' {
+                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
+                if ($script:SelectedUser) { Show-HelpdeskUserStatus $script:SelectedUser }
+            }
+            '3' {
+                Unlock-HelpdeskUser $script:SelectedUser
+                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
+            }
+            '4' {
+                Reset-HelpdeskPassword $script:SelectedUser
+                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
+            }
+            'b' { return }
+            default { Write-Host "Invalid option." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-MachineMenu {
+    while ($true) {
+        $label = if ($script:SelectedComputer) { $script:SelectedComputer } else { 'none' }
+
+        Write-Host ""
+        Write-Host "=== Machine Functions ===  Selected computer: $label" -ForegroundColor Cyan
+        Write-Host "  1) Look up computer info"
+        Write-Host "  2) Refresh computer info"
+        Write-Host "  B) Back"
+        $selection = Read-Host "Choose an option"
+
+        switch ($selection) {
+            '1' {
+                $lookup = (Read-Host "Enter hostname or IP").Trim()
+                if ($lookup -and (Show-HelpdeskComputerInfo $lookup)) {
+                    $script:SelectedComputer = $lookup
+                }
+            }
+            { $_ -in '2' -and -not $script:SelectedComputer } {
+                Write-Host "Look up a computer first (option 1)." -ForegroundColor Yellow
+                break
+            }
+            '2' {
+                $null = Show-HelpdeskComputerInfo $script:SelectedComputer
+            }
+            'b' { return }
+            default { Write-Host "Invalid option." -ForegroundColor Yellow }
+        }
+    }
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+# Optional shortcuts: .\HelpdeskMultitool.ps1 jsmith   or   -ComputerName PC01
 if ($Username) {
-    $selectedUser = Find-HelpdeskUser $Username
-    if ($selectedUser) { Show-HelpdeskUserStatus $selectedUser }
+    $script:SelectedUser = Find-HelpdeskUser $Username
+    if ($script:SelectedUser) { Show-HelpdeskUserStatus $script:SelectedUser }
+    Show-UserMenu
+} elseif ($ComputerName) {
+    if (Show-HelpdeskComputerInfo $ComputerName) { $script:SelectedComputer = $ComputerName.Trim() }
+    Show-MachineMenu
 }
 
 while ($true) {
-    $label = if ($selectedUser) { "$($selectedUser.DisplayName) ($($selectedUser.SamAccountName))" } else { 'none' }
-
     Write-Host ""
-    Write-Host "=== Helpdesk Multitool ===  Selected user: $label" -ForegroundColor Cyan
-    Write-Host "  1) Look up user"
-    Write-Host "  2) Refresh status"
-    Write-Host "  3) Unlock account"
-    Write-Host "  4) Reset password"
+    Write-Host "=== Helpdesk Multitool ===" -ForegroundColor Cyan
+    Write-Host "  1) User functions"
+    Write-Host "  2) Machine functions"
     Write-Host "  Q) Quit"
     $selection = Read-Host "Choose an option"
 
     switch ($selection) {
-        '1' {
-            $lookup = Read-Host "Enter username, UPN, or email"
-            $found  = Find-HelpdeskUser $lookup
-            if ($found) {
-                $selectedUser = $found
-                Show-HelpdeskUserStatus $selectedUser
-            }
-        }
-        { $_ -in '2', '3', '4' -and -not $selectedUser } {
-            Write-Host "Look up a user first (option 1)." -ForegroundColor Yellow
-            break
-        }
-        '2' {
-            $selectedUser = Find-HelpdeskUser $selectedUser.SamAccountName
-            if ($selectedUser) { Show-HelpdeskUserStatus $selectedUser }
-        }
-        '3' {
-            Unlock-HelpdeskUser $selectedUser
-            $selectedUser = Find-HelpdeskUser $selectedUser.SamAccountName
-        }
-        '4' {
-            Reset-HelpdeskPassword $selectedUser
-            $selectedUser = Find-HelpdeskUser $selectedUser.SamAccountName
-        }
+        '1' { Show-UserMenu }
+        '2' { Show-MachineMenu }
         'q' { return }
         default { Write-Host "Invalid option." -ForegroundColor Yellow }
     }
