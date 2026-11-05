@@ -333,7 +333,97 @@ function Test-RemoteRegKey {
     } catch { return $false }
 }
 
-function Show-HelpdeskComputerInfo {
+function Get-HelpdeskADComputer {
+    # Returns the AD computer object or $null (with a message)
+    param([string]$ShortName)
+    try {
+        return Get-ADComputer -Identity $ShortName -Server $script:DC -Properties $script:ComputerProps -ErrorAction Stop
+    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+        Write-Host "No computer named '$ShortName' in Active Directory." -ForegroundColor Yellow
+    } catch {
+        Write-Host "AD lookup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    return $null
+}
+
+function Write-DnsMismatchWarning {
+    # Stale DNS can point a hostname at a different PC; make that obvious
+    param([string]$Name, [string]$ShortName, [bool]$IsIp, $ComputerSystem)
+    if (-not $IsIp -and $ComputerSystem -and $ComputerSystem.Name -ne $ShortName) {
+        Write-Host "WARNING: '$Name' answered as '$($ComputerSystem.Name)'. DNS may be stale - this may be a different PC." -ForegroundColor Red
+    }
+}
+
+function Show-HelpdeskComputerSummary {
+    # Quick lookup: the handful of details most tickets need. Returns $true if anything was found.
+    param([string]$ComputerName)
+
+    $name = $ComputerName.Trim()
+    if (-not $name) { return $false }
+
+    $parsedIp  = $null
+    $isIp      = [ipaddress]::TryParse($name, [ref]$parsedIp)
+    $shortName = if ($isIp) { $name } else { ($name -split '\.')[0] }
+
+    Write-Host "`nQuerying $name ..." -ForegroundColor Cyan
+
+    $ad = if (-not $isIp) { Get-HelpdeskADComputer $shortName }
+
+    $cs = $bios = $os = $nics = $displayVersion = $null
+    $session = New-HelpdeskCimSession $name
+    if ($session) {
+        try {
+            $cs             = Get-OptionalCim $session 'Win32_ComputerSystem'
+            $bios           = Get-OptionalCim $session 'Win32_BIOS'
+            $os             = Get-OptionalCim $session 'Win32_OperatingSystem'
+            $nics           = Get-OptionalCim $session 'Win32_NetworkAdapterConfiguration' -Filter 'IPEnabled = True'
+            $displayVersion = Get-RemoteRegValue $session 'SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'DisplayVersion'
+        } finally {
+            Remove-CimSession $session
+        }
+    }
+
+    Write-Host "------------------------------------------------"
+    Write-Row 'Computer'             (& { if ($cs) { $cs.Name } elseif ($ad) { $ad.Name } else { $name } })
+    Write-Row 'Status'               (& { if ($session) { 'Online' } else { 'Offline / unreachable' } }) `
+                                     (& { if ($session) { 'Green' } else { 'Red' } })
+    if ($ad -and -not $ad.Enabled) {
+        Write-Row 'AD account'       'DISABLED' 'Red'
+    }
+    if ($cs) {
+        Write-Row 'Logged-on user'   (& { if ($cs.UserName) { $cs.UserName } else { 'None at console' } })
+        Write-Row 'Model'            "$($cs.Manufacturer) $($cs.Model)"
+    }
+    if ($bios) {
+        Write-Row 'Serial / Service Tag' $bios.SerialNumber.Trim() 'Green'
+    }
+    if ($os) {
+        $uptime = (Get-Date) - $os.LastBootUpTime
+        Write-Row 'OS'               "$($os.Caption) $displayVersion"
+        Write-Row 'Last boot'        ("{0}  (up {1}d {2}h)" -f (Format-Date $os.LastBootUpTime), $uptime.Days, $uptime.Hours) `
+                                     (& { if ($uptime.TotalDays -gt 7) { 'Yellow' } })
+    }
+    if ($ad) {
+        Write-Row 'Last logon (approx)' (Format-Date $ad.LastLogonDate)
+    }
+    # One line per active adapter so each IP stays paired with its MAC
+    if ($nics) {
+        foreach ($n in $nics) {
+            $ipv4 = ($n.IPAddress | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) -join ', '
+            Write-Row 'IPv4 / MAC'       "$ipv4  /  $($n.MACAddress)"
+        }
+    } elseif ($ad) {
+        Write-Row 'IPv4 (DNS)'           $ad.IPv4Address
+    }
+    Write-Host "------------------------------------------------"
+
+    Write-DnsMismatchWarning $name $shortName $isIp $cs
+
+    return [bool]($ad -or $session)
+}
+
+function Show-HelpdeskComputerReport {
+    # Full report: everything the quick lookup shows plus hardware, storage, BitLocker and network detail.
     # Accepts a hostname, FQDN, or IP. Returns $true if anything was found.
     param([string]$ComputerName)
 
@@ -348,16 +438,7 @@ function Show-HelpdeskComputerInfo {
     Write-Row 'Lookup time' (Get-Date -Format 'dd-MMM-yyyy hh:mm:ss tt')
 
     # --- Active Directory (available even when the PC is offline) ---
-    $ad = $null
-    if (-not $isIp) {
-        try {
-            $ad = Get-ADComputer -Identity $shortName -Server $script:DC -Properties $script:ComputerProps -ErrorAction Stop
-        } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-            Write-Host "No computer named '$shortName' in Active Directory." -ForegroundColor Yellow
-        } catch {
-            Write-Host "AD lookup failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
+    $ad = if (-not $isIp) { Get-HelpdeskADComputer $shortName }
 
     if ($ad) {
         $ou = if ($ad.CanonicalName) { $ad.CanonicalName.Substring(0, $ad.CanonicalName.LastIndexOf('/')) } else { '' }
@@ -392,10 +473,7 @@ function Show-HelpdeskComputerInfo {
         $disks = Get-OptionalCim $session 'Win32_LogicalDisk' -Filter 'DriveType = 3'
         $nics  = Get-OptionalCim $session 'Win32_NetworkAdapterConfiguration' -Filter 'IPEnabled = True'
 
-        # Stale DNS can point a hostname at a different PC; make that obvious
-        if (-not $isIp -and $cs -and $cs.Name -ne $shortName) {
-            Write-Host "WARNING: '$name' answered as '$($cs.Name)'. DNS may be stale - this may be a different PC." -ForegroundColor Red
-        }
+        Write-DnsMismatchWarning $name $shortName $isIp $cs
 
         # --- System ---
         Write-Section 'System'
@@ -531,30 +609,39 @@ function Show-UserMenu {
     }
 }
 
+function Read-ComputerTarget {
+    # Prompts for a hostname; pressing Enter reuses the selected computer
+    $prompt = if ($script:SelectedComputer) {
+        "Enter hostname or IP [Enter for $($script:SelectedComputer)]"
+    } else { "Enter hostname or IP" }
+    $target = (Read-Host $prompt).Trim()
+    if (-not $target) { $target = $script:SelectedComputer }
+    return $target
+}
+
 function Show-MachineMenu {
     while ($true) {
         $label = if ($script:SelectedComputer) { $script:SelectedComputer } else { 'none' }
 
         Write-Host ""
         Write-Host "=== Machine Functions ===  Selected computer: $label" -ForegroundColor Cyan
-        Write-Host "  1) Look up computer info"
-        Write-Host "  2) Refresh computer info"
+        Write-Host "  1) Quick lookup"
+        Write-Host "  2) Full report"
         Write-Host "  B) Back"
         $selection = Read-Host "Choose an option"
 
         switch ($selection) {
             '1' {
-                $lookup = (Read-Host "Enter hostname or IP").Trim()
-                if ($lookup -and (Show-HelpdeskComputerInfo $lookup)) {
-                    $script:SelectedComputer = $lookup
+                $target = Read-ComputerTarget
+                if ($target -and (Show-HelpdeskComputerSummary $target)) {
+                    $script:SelectedComputer = $target
                 }
             }
-            { $_ -in '2' -and -not $script:SelectedComputer } {
-                Write-Host "Look up a computer first (option 1)." -ForegroundColor Yellow
-                break
-            }
             '2' {
-                $null = Show-HelpdeskComputerInfo $script:SelectedComputer
+                $target = Read-ComputerTarget
+                if ($target -and (Show-HelpdeskComputerReport $target)) {
+                    $script:SelectedComputer = $target
+                }
             }
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Yellow }
@@ -572,7 +659,7 @@ if ($Username) {
     if ($script:SelectedUser) { Show-HelpdeskUserStatus $script:SelectedUser }
     Show-UserMenu
 } elseif ($ComputerName) {
-    if (Show-HelpdeskComputerInfo $ComputerName) { $script:SelectedComputer = $ComputerName.Trim() }
+    if (Show-HelpdeskComputerSummary $ComputerName) { $script:SelectedComputer = $ComputerName.Trim() }
     Show-MachineMenu
 }
 
