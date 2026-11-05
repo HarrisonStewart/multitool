@@ -32,7 +32,9 @@ $script:UserProps = @(
     'DisplayName', 'Mail', 'Enabled', 'LockedOut', 'AccountLockoutTime',
     'BadLogonCount', 'LastBadPasswordAttempt', 'PasswordExpired', 'PasswordLastSet',
     'PasswordNeverExpires', 'msDS-UserPasswordExpiryTimeComputed',
-    'LastLogonDate', 'AccountExpirationDate'
+    'LastLogonDate', 'AccountExpirationDate', 'Title', 'Department', 'Manager',
+    'Office', 'OfficePhone', 'Description', 'CanonicalName', 'whenCreated',
+    'whenChanged', 'MemberOf'
 )
 
 $script:ComputerProps = @(
@@ -144,32 +146,15 @@ function Find-HelpdeskUser {
     return $null
 }
 
-function Show-HelpdeskUserStatus {
+function Get-NameFromDN {
+    # "CN=Smith\, John,OU=Sales,DC=..." -> "Smith, John"
+    param([string]$DN)
+    if ($DN -match '^CN=((?:\\,|[^,])+)') { $Matches[1] -replace '\\,', ',' } else { $DN }
+}
+
+function Write-UserWarnings {
+    # Flag conditions an unlock or reset won't fix, plus the common ticket causes
     param($User)
-
-    $rows = [ordered]@{
-        'Lookup time'          = Get-Date -Format 'dd-MMM-yyyy hh:mm:ss tt'
-        'Name'                 = $User.DisplayName
-        'Username'             = $User.SamAccountName
-        'UPN'                  = $User.UserPrincipalName
-        'Email'                = $User.Mail
-        'Enabled'              = $User.Enabled
-        'Locked out'           = $User.LockedOut
-        'Lockout time'         = $User.AccountLockoutTime
-        'Bad password count'   = $User.BadLogonCount
-        'Last bad password'    = $User.LastBadPasswordAttempt
-        'Password expired'     = $User.PasswordExpired
-        'Password last set'    = $User.PasswordLastSet
-        'Password expires'     = Get-PasswordExpiryText $User
-        'Account expires'      = if ($User.AccountExpirationDate) { $User.AccountExpirationDate } else { 'Never' }
-        'Last logon (approx)'  = $User.LastLogonDate
-    }
-
-    Write-Host "`n------------------------------------------------"
-    foreach ($key in $rows.Keys) { Write-Row $key $rows[$key] }
-    Write-Host "------------------------------------------------"
-
-    # Flag conditions an unlock or reset won't fix
     if (-not $User.Enabled) {
         Write-Host "WARNING: Account is DISABLED." -ForegroundColor Red
     }
@@ -182,6 +167,75 @@ function Show-HelpdeskUserStatus {
     if ($User.PasswordExpired) {
         Write-Host "Password is expired." -ForegroundColor Yellow
     }
+}
+
+function Show-HelpdeskUserSummary {
+    # Quick lookup: identity plus the status fields most tickets need
+    param($User)
+
+    Write-Host "`n------------------------------------------------"
+    Write-Row 'Name'                 $User.DisplayName
+    Write-Row 'Username'             $User.SamAccountName
+    Write-Row 'Email'                $User.Mail
+    Write-Row 'Title'                $User.Title
+    Write-Row 'Enabled'              $User.Enabled
+    Write-Row 'Locked out'           $User.LockedOut
+    Write-Row 'Password expired'     $User.PasswordExpired
+    Write-Row 'Password expires'     (Get-PasswordExpiryText $User)
+    Write-Row 'Last logon (approx)'  (Format-Date $User.LastLogonDate)
+    Write-Host "------------------------------------------------"
+
+    Write-UserWarnings $User
+}
+
+function Show-HelpdeskUserReport {
+    # Full report: everything in the quick lookup plus org details, lockout detail, and groups
+    param($User)
+
+    $ou = if ($User.CanonicalName) { $User.CanonicalName.Substring(0, $User.CanonicalName.LastIndexOf('/')) } else { '' }
+
+    Write-Row 'Lookup time' (Get-Date -Format 'dd-MMM-yyyy hh:mm:ss tt')
+
+    Write-Section 'Identity'
+    Write-Row 'Name'                 $User.DisplayName
+    Write-Row 'Username'             $User.SamAccountName
+    Write-Row 'UPN'                  $User.UserPrincipalName
+    Write-Row 'Email'                $User.Mail
+    Write-Row 'Title'                $User.Title
+    Write-Row 'Department'           $User.Department
+    Write-Row 'Manager'              (& { if ($User.Manager) { Get-NameFromDN $User.Manager } })
+    Write-Row 'Office'               $User.Office
+    Write-Row 'Phone'                $User.OfficePhone
+    Write-Row 'Description'          $User.Description
+    Write-Row 'OU'                   $ou
+    Write-Row 'Created'              (Format-Date $User.whenCreated)
+    Write-Row 'Last modified'        (Format-Date $User.whenChanged)
+
+    Write-Section 'Account'
+    Write-Row 'Enabled'              $User.Enabled
+    Write-Row 'Account expires'      (& { if ($User.AccountExpirationDate) { Format-Date $User.AccountExpirationDate } else { 'Never' } })
+    Write-Row 'Last logon (approx)'  (Format-Date $User.LastLogonDate)
+    Write-Row 'Locked out'           $User.LockedOut
+    Write-Row 'Lockout time'         (Format-Date $User.AccountLockoutTime)
+    Write-Row 'Bad password count'   $User.BadLogonCount
+    Write-Row 'Last bad password'    (Format-Date $User.LastBadPasswordAttempt)
+
+    Write-Section 'Password'
+    Write-Row 'Last set'             (Format-Date $User.PasswordLastSet)
+    Write-Row 'Expires'              (Get-PasswordExpiryText $User)
+    Write-Row 'Expired'              $User.PasswordExpired
+    Write-Row 'Never expires'        $User.PasswordNeverExpires
+
+    $groups = @($User.MemberOf | ForEach-Object { Get-NameFromDN $_ } | Sort-Object)
+    Write-Section "Groups ($($groups.Count) direct; primary group not shown)"
+    if ($groups.Count) {
+        foreach ($g in $groups) { Write-Host "  $g" }
+    } else {
+        Write-Host "  (none besides primary group)"
+    }
+
+    Write-Host ""
+    Write-UserWarnings $User
 }
 
 function Unlock-HelpdeskUser {
@@ -559,9 +613,88 @@ function Show-HelpdeskComputerReport {
     return $true
 }
 
+function Search-HelpdeskSoftware {
+    # Searches the target's uninstall registry keys (what Programs and Features shows).
+    # Blank search term lists everything. Returns $true if the PC was reached.
+    param([string]$ComputerName)
+
+    $name = $ComputerName.Trim()
+    if (-not $name) { return $false }
+
+    $parsedIp  = $null
+    $isIp      = [ipaddress]::TryParse($name, [ref]$parsedIp)
+    $shortName = if ($isIp) { $name } else { ($name -split '\.')[0] }
+
+    $term = (Read-Host "Search for (name or publisher, blank lists all)").Trim()
+    Write-Host "`nSearching $name ..." -ForegroundColor Cyan
+
+    $remote = {
+        param($Term)
+        $paths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        # Per-user installs (Zoom, Teams, etc.) for anyone currently logged on
+        Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' } |
+            ForEach-Object { $paths += "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" }
+
+        $apps = Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -and $_.SystemComponent -ne 1 -and
+                (-not $Term -or $_.DisplayName -like "*$Term*" -or $_.Publisher -like "*$Term*")
+            } |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate,
+                @{ n = 'Scope'; e = { if ($_.PSPath -match 'HKEY_USERS') { 'User' } else { 'Machine' } } }
+
+        [pscustomobject]@{ ComputerName = $env:COMPUTERNAME; Apps = @($apps) }
+    }
+
+    try {
+        $opt    = New-PSSessionOption -OpenTimeout 15000
+        $result = Invoke-Command -ComputerName $name -ScriptBlock $remote -ArgumentList $term -SessionOption $opt -ErrorAction Stop
+    } catch {
+        Write-Host "Could not query $name over WinRM: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+
+    Write-DnsMismatchWarning $name $shortName $isIp ([pscustomobject]@{ Name = $result.ComputerName })
+
+    $apps = @($result.Apps | Where-Object { $_.DisplayName } | Sort-Object DisplayName, DisplayVersion -Unique)
+    if (-not $apps.Count) {
+        $what = if ($term) { "matching '$term'" } else { 'found' }
+        Write-Host "No installed programs $what on $($result.ComputerName)." -ForegroundColor Yellow
+        return $true
+    }
+
+    $apps | Format-Table -AutoSize `
+        @{ n = 'Name';      e = { $_.DisplayName } },
+        @{ n = 'Version';   e = { $_.DisplayVersion } },
+        'Publisher',
+        @{ n = 'Installed'; e = {
+            if ($_.InstallDate -match '^\d{8}$') {
+                [datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null).ToString('dd-MMM-yyyy')
+            } else { $_.InstallDate }
+        } },
+        'Scope' | Out-Host
+
+    Write-Host "$($apps.Count) program(s) on $($result.ComputerName)." -ForegroundColor Green
+    return $true
+}
+
 # ===========================================================================
 # Menus
 # ===========================================================================
+
+function Read-UserTarget {
+    # Prompts for a user; pressing Enter reuses the selected user
+    $prompt = if ($script:SelectedUser) {
+        "Enter username, UPN, or email [Enter for $($script:SelectedUser.SamAccountName)]"
+    } else { "Enter username, UPN, or email" }
+    $target = (Read-Host $prompt).Trim()
+    if (-not $target -and $script:SelectedUser) { $target = $script:SelectedUser.SamAccountName }
+    return $target
+}
 
 function Show-UserMenu {
     while ($true) {
@@ -571,37 +704,35 @@ function Show-UserMenu {
 
         Write-Host ""
         Write-Host "=== User Functions ===  Selected user: $label" -ForegroundColor Cyan
-        Write-Host "  1) Look up user"
-        Write-Host "  2) Refresh status"
+        Write-Host "  1) Quick lookup"
+        Write-Host "  2) Full report"
         Write-Host "  3) Unlock account"
         Write-Host "  4) Reset password"
         Write-Host "  B) Back"
         $selection = Read-Host "Choose an option"
 
         switch ($selection) {
-            '1' {
-                $lookup = Read-Host "Enter username, UPN, or email"
-                $found  = Find-HelpdeskUser $lookup
+            { $_ -in '1', '2' } {
+                $target = Read-UserTarget
+                if (-not $target) { break }
+                $found = Find-HelpdeskUser $target
                 if ($found) {
                     $script:SelectedUser = $found
-                    Show-HelpdeskUserStatus $script:SelectedUser
+                    if ($_ -eq '1') { Show-HelpdeskUserSummary $found } else { Show-HelpdeskUserReport $found }
                 }
-            }
-            { $_ -in '2', '3', '4' -and -not $script:SelectedUser } {
-                Write-Host "Look up a user first (option 1)." -ForegroundColor Yellow
                 break
             }
-            '2' {
-                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
-                if ($script:SelectedUser) { Show-HelpdeskUserStatus $script:SelectedUser }
-            }
-            '3' {
-                Unlock-HelpdeskUser $script:SelectedUser
-                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
-            }
-            '4' {
-                Reset-HelpdeskPassword $script:SelectedUser
-                $script:SelectedUser = Find-HelpdeskUser $script:SelectedUser.SamAccountName
+            { $_ -in '3', '4' } {
+                if (-not $script:SelectedUser) {
+                    Write-Host "Look up a user first (option 1 or 2)." -ForegroundColor Yellow
+                    break
+                }
+                # Re-read before acting so lockout/expiry state is current
+                $fresh = Find-HelpdeskUser $script:SelectedUser.SamAccountName
+                if (-not $fresh) { break }
+                $script:SelectedUser = $fresh
+                if ($_ -eq '3') { Unlock-HelpdeskUser $fresh } else { Reset-HelpdeskPassword $fresh }
+                break
             }
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Yellow }
@@ -627,6 +758,7 @@ function Show-MachineMenu {
         Write-Host "=== Machine Functions ===  Selected computer: $label" -ForegroundColor Cyan
         Write-Host "  1) Quick lookup"
         Write-Host "  2) Full report"
+        Write-Host "  3) Search installed software"
         Write-Host "  B) Back"
         $selection = Read-Host "Choose an option"
 
@@ -643,6 +775,12 @@ function Show-MachineMenu {
                     $script:SelectedComputer = $target
                 }
             }
+            '3' {
+                $target = Read-ComputerTarget
+                if ($target -and (Search-HelpdeskSoftware $target)) {
+                    $script:SelectedComputer = $target
+                }
+            }
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Yellow }
         }
@@ -656,7 +794,7 @@ function Show-MachineMenu {
 # Optional shortcuts: .\HelpdeskMultitool.ps1 jsmith   or   -ComputerName PC01
 if ($Username) {
     $script:SelectedUser = Find-HelpdeskUser $Username
-    if ($script:SelectedUser) { Show-HelpdeskUserStatus $script:SelectedUser }
+    if ($script:SelectedUser) { Show-HelpdeskUserSummary $script:SelectedUser }
     Show-UserMenu
 } elseif ($ComputerName) {
     if (Show-HelpdeskComputerSummary $ComputerName) { $script:SelectedComputer = $ComputerName.Trim() }
