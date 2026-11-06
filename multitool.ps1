@@ -326,6 +326,118 @@ function Reset-HelpdeskPassword {
     }
 }
 
+function Show-HelpdeskAllUsersReport {
+    # Exports every AD user with account, password, and org details, and flags common
+    # cleanup items. AD-only query, so no remote connections and it runs in seconds.
+
+    $days = (Read-Host "Flag enabled accounts inactive for how many days? [Default: 90]").Trim()
+    if ($days -notmatch '^\d+$') { $days = 90 }
+    $cutoff = (Get-Date).AddDays(-[int]$days)
+
+    $ou = (Read-Host "Limit to an OU (distinguished name), or blank for the whole domain").Trim()
+
+    $adParams = @{
+        Filter      = '*'
+        Properties  = $script:UserProps
+        Server      = $script:DC
+        ErrorAction = 'Stop'
+    }
+    if ($ou) { $adParams.SearchBase = $ou }
+
+    Write-Host "`nQuerying Active Directory..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser @adParams)
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    if (-not $users.Count) {
+        Write-Host "No users found." -ForegroundColor Yellow
+        return
+    }
+
+    $now = Get-Date
+    $rows = foreach ($u in $users) {
+        # Flags only apply to enabled accounts; new accounts aren't flagged as inactive
+        $flags = @()
+        if (-not $u.Enabled) {
+            $flags += 'Disabled'
+        } else {
+            if ($u.LockedOut)            { $flags += 'Locked out' }
+            if ($u.PasswordExpired)      { $flags += 'Password expired' }
+            if ($u.PasswordNeverExpires) { $flags += 'Password never expires' }
+            if ($u.AccountExpirationDate -and $u.AccountExpirationDate -lt $now) { $flags += 'Account expired' }
+            if ($u.whenCreated -lt $cutoff) {
+                if (-not $u.LastLogonDate)             { $flags += 'Never logged on' }
+                elseif ($u.LastLogonDate -lt $cutoff)  { $flags += "Inactive $days+ days" }
+            }
+        }
+
+        $groups = @($u.MemberOf | ForEach-Object { Get-NameFromDN $_ } | Sort-Object)
+        $ouPath = if ($u.CanonicalName) { $u.CanonicalName.Substring(0, $u.CanonicalName.LastIndexOf('/')) } else { '' }
+
+        [pscustomobject]@{
+            Name                     = $u.DisplayName
+            Username                 = $u.SamAccountName
+            UPN                      = $u.UserPrincipalName
+            Email                    = $u.Mail
+            Title                    = $u.Title
+            Department               = $u.Department
+            Manager                  = if ($u.Manager) { Get-NameFromDN $u.Manager } else { '' }
+            Office                   = $u.Office
+            Phone                    = $u.OfficePhone
+            OU                       = $ouPath
+            Enabled                  = $u.Enabled
+            'Locked Out'             = $u.LockedOut
+            'Last Logon'             = Format-Date $u.LastLogonDate
+            'Days Since Logon'       = if ($u.LastLogonDate) { ($now - $u.LastLogonDate).Days } else { 'Never' }
+            Created                  = Format-Date $u.whenCreated
+            'Password Last Set'      = Format-Date $u.PasswordLastSet
+            'Password Expires'       = Get-PasswordExpiryText $u
+            'Password Never Expires' = $u.PasswordNeverExpires
+            'Account Expires'        = if ($u.AccountExpirationDate) { Format-Date $u.AccountExpirationDate } else { 'Never' }
+            'Group Count'            = $groups.Count
+            Groups                   = $groups -join '; '
+            Description              = $u.Description
+            Flags                    = $flags -join '; '
+        }
+    }
+
+    $enabledRows = @($rows | Where-Object { $_.Enabled })
+    function Get-FlagCount([string]$Flag) { @($rows | Where-Object { $_.Flags -like "*$Flag*" }).Count }
+
+    Write-Section 'Summary'
+    Write-Row 'Total accounts'          $rows.Count
+    Write-Row 'Enabled'                 $enabledRows.Count
+    Write-Row 'Disabled'                ($rows.Count - $enabledRows.Count)
+    Write-Row 'Locked out'              (Get-FlagCount 'Locked out')
+    Write-Row 'Password expired'        (Get-FlagCount 'Password expired')
+    Write-Row 'Password never expires'  (Get-FlagCount 'Password never expires')
+    Write-Row 'Account expired'         (Get-FlagCount 'Account expired')
+    Write-Row "Inactive $days+ days"    (Get-FlagCount 'Inactive')
+    Write-Row 'Never logged on'         (Get-FlagCount 'Never logged on')
+
+    Write-Section 'Enabled users by department'
+    $enabledRows | Group-Object Department |
+        ForEach-Object {
+            [pscustomobject]@{
+                Department = if ($_.Name) { $_.Name } else { '(none)' }
+                Users      = $_.Count
+            }
+        } |
+        Sort-Object Users -Descending |
+        Format-Table -AutoSize | Out-Host
+
+    $csv = Join-Path ([Environment]::GetFolderPath('Desktop')) "AllUsers_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+    try {
+        $rows | Sort-Object @{ e = { $_.Enabled }; Descending = $true }, Department, Name |
+            Export-Csv -Path $csv -NoTypeInformation -ErrorAction Stop
+        Write-Host "Full results saved to: $csv" -ForegroundColor Green
+    } catch {
+        Write-Host "Could not save CSV: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
 # ===========================================================================
 # Machine functions
 # ===========================================================================
@@ -682,6 +794,156 @@ function Search-HelpdeskSoftware {
     return $true
 }
 
+function Show-HelpdeskFleetModelReport {
+    # Scans all active Windows workstations in parallel and groups them by model.
+    # Collects the same core details as the quick lookup, but fans out over WinRM
+    # so hundreds of PCs finish in minutes instead of hours.
+
+    $days = (Read-Host "Include PCs active in AD within how many days? [Default: 90]").Trim()
+    if ($days -notmatch '^\d+$') { $days = 90 }
+    $cutoff = (Get-Date).AddDays(-[int]$days)
+
+    $ou = (Read-Host "Limit to an OU (distinguished name), or blank for the whole domain").Trim()
+
+    $adParams = @{
+        Filter      = 'Enabled -eq $true -and OperatingSystem -like "*Windows*" -and OperatingSystem -notlike "*Server*"'
+        Properties  = 'LastLogonDate', 'OperatingSystem', 'CanonicalName'
+        Server      = $script:DC
+        ErrorAction = 'Stop'
+    }
+    if ($ou) { $adParams.SearchBase = $ou }
+
+    try {
+        $adComputers = @(Get-ADComputer @adParams | Where-Object { $_.LastLogonDate -gt $cutoff })
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    if (-not $adComputers.Count) {
+        Write-Host "No matching computers found." -ForegroundColor Yellow
+        return
+    }
+    if (-not (Read-YesNo "Scan $($adComputers.Count) computers?" -Default $true)) { return }
+
+    $adLookup = @{}
+    foreach ($c in $adComputers) { $adLookup[$c.Name] = $c }
+
+    $scan = {
+        $cs    = Get-CimInstance Win32_ComputerSystem
+        $bios  = Get-CimInstance Win32_BIOS
+        $cpu   = Get-CimInstance Win32_Processor | Select-Object -First 1
+        $os    = Get-CimInstance Win32_OperatingSystem
+        $nt    = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+        $disk  = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID = '$($os.SystemDrive)'"
+        $nics  = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True')
+
+        # Windows feature version (older Windows 10 builds use ReleaseId instead of DisplayVersion)
+        $release    = if ($nt.DisplayVersion) { $nt.DisplayVersion } else { $nt.ReleaseId }
+        $winVersion = "$release (build $($nt.CurrentBuild).$($nt.UBR))"
+
+        [pscustomobject]@{
+            Name         = $env:COMPUTERNAME
+            Manufacturer = $cs.Manufacturer
+            Model        = $cs.Model
+            Serial       = "$($bios.SerialNumber)".Trim()
+            CPU          = "$($cpu.Name)".Trim()
+            BIOSVersion  = $bios.SMBIOSBIOSVersion
+            BIOSDate     = $bios.ReleaseDate
+            OS           = $os.Caption
+            WinVersion   = $winVersion
+            FreeGB       = if ($disk.Size) { [math]::Round($disk.FreeSpace / 1GB, 1) } else { $null }
+            FreePct      = if ($disk.Size) { [math]::Round($disk.FreeSpace / $disk.Size * 100) } else { $null }
+            IPv4         = ($nics | ForEach-Object { $_.IPAddress | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } }) -join '; '
+            MAC          = ($nics.MACAddress | Where-Object { $_ }) -join '; '
+            User         = $cs.UserName
+        }
+    }
+
+    Write-Host "`nScanning $($adComputers.Count) computers (offline PCs time out after ~15 seconds)..." -ForegroundColor Cyan
+    $opt     = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 60000
+    $results = @(Invoke-Command -ComputerName $adComputers.Name -ScriptBlock $scan -SessionOption $opt `
+                    -ThrottleLimit 32 -ErrorAction SilentlyContinue)
+
+    function Get-OuPath($c) {
+        if ($c.CanonicalName) { $c.CanonicalName.Substring(0, $c.CanonicalName.LastIndexOf('/')) } else { '' }
+    }
+
+    $rows = @()
+    foreach ($r in $results) {
+        $ad = $adLookup[$r.PSComputerName]
+        $rows += [pscustomobject]@{
+            Computer           = $r.PSComputerName
+            Status             = if ($r.Name -ne $r.PSComputerName) { "Online - answered as $($r.Name)" } else { 'Online' }
+            OU                 = Get-OuPath $ad
+            Manufacturer       = $r.Manufacturer
+            Model              = $r.Model
+            Serial             = $r.Serial
+            CPU                = ($r.CPU -replace '\(R\)|\(TM\)|CPU|@.*$', '' -replace '\s+', ' ').Trim()
+            OS                 = $r.OS
+            'Windows Version'  = $r.WinVersion
+            'Disk Free GB'     = $r.FreeGB
+            'Disk Free %'      = $r.FreePct
+            IPv4               = $r.IPv4
+            MAC                = $r.MAC
+            'BIOS Version'     = $r.BIOSVersion
+            'BIOS Date'        = if ($r.BIOSDate) { ([datetime]$r.BIOSDate).ToString('yyyy-MM-dd') } else { '' }
+            'Current User'     = $r.User
+            'Last Logon'       = Format-Date $ad.LastLogonDate
+        }
+    }
+
+    $reached = @($results.PSComputerName)
+    foreach ($c in $adComputers | Where-Object { $_.Name -notin $reached }) {
+        $rows += [pscustomobject]@{
+            Computer           = $c.Name
+            Status             = 'Unreachable'
+            OU                 = Get-OuPath $c
+            Manufacturer       = ''
+            Model              = ''
+            Serial             = ''
+            CPU                = ''
+            OS                 = $c.OperatingSystem
+            'Windows Version'  = ''
+            'Disk Free GB'     = ''
+            'Disk Free %'      = ''
+            IPv4               = ''
+            MAC                = ''
+            'BIOS Version'     = ''
+            'BIOS Date'        = ''
+            'Current User'     = ''
+            'Last Logon'       = Format-Date $c.LastLogonDate
+        }
+    }
+
+    # Sorted by manufacturer and model; unreachable PCs go to the bottom
+    $sorted = $rows | Sort-Object @{ e = { $_.Status -eq 'Unreachable' } }, Manufacturer, Model, Computer
+    $online = @($sorted | Where-Object { $_.Status -ne 'Unreachable' })
+    $offline = $rows.Count - $online.Count
+
+    Write-Host "`n$($online.Count) online, $offline unreachable." -ForegroundColor Green
+
+    Write-Section 'Devices by model'
+    $online | Group-Object Manufacturer, Model |
+        ForEach-Object {
+            [pscustomobject]@{
+                Manufacturer = $_.Group[0].Manufacturer
+                Model        = $_.Group[0].Model
+                Count        = $_.Count
+            }
+        } |
+        Sort-Object Manufacturer, Model |
+        Format-Table -AutoSize | Out-Host
+
+    $csv = Join-Path ([Environment]::GetFolderPath('Desktop')) "FleetModels_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+    try {
+        $sorted | Export-Csv -Path $csv -NoTypeInformation -ErrorAction Stop
+        Write-Host "Full results (including unreachable PCs) saved to: $csv" -ForegroundColor Green
+    } catch {
+        Write-Host "Could not save CSV: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
 # ===========================================================================
 # Menus
 # ===========================================================================
@@ -708,6 +970,7 @@ function Show-UserMenu {
         Write-Host "  2) Full report"
         Write-Host "  3) Unlock account"
         Write-Host "  4) Reset password"
+        Write-Host "  5) All users report"
         Write-Host "  B) Back"
         $selection = Read-Host "Choose an option"
 
@@ -734,6 +997,7 @@ function Show-UserMenu {
                 if ($_ -eq '3') { Unlock-HelpdeskUser $fresh } else { Reset-HelpdeskPassword $fresh }
                 break
             }
+            '5' { Show-HelpdeskAllUsersReport }
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Yellow }
         }
@@ -759,6 +1023,7 @@ function Show-MachineMenu {
         Write-Host "  1) Quick lookup"
         Write-Host "  2) Full report"
         Write-Host "  3) Search installed software"
+        Write-Host "  4) Fleet model report (all PCs)"
         Write-Host "  B) Back"
         $selection = Read-Host "Choose an option"
 
@@ -781,6 +1046,7 @@ function Show-MachineMenu {
                     $script:SelectedComputer = $target
                 }
             }
+            '4' { Show-HelpdeskFleetModelReport }
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Yellow }
         }
