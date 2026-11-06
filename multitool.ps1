@@ -80,6 +80,24 @@ function Format-Date {
     if ($Date) { ([datetime]$Date).ToString('dd-MMM-yyyy hh:mm tt') } else { '' }
 }
 
+function Read-Days {
+    param([string]$Prompt, [int]$Default)
+    $value = (Read-Host "$Prompt [Default: $Default]").Trim()
+    if ($value -match '^\d+$') { [int]$value } else { $Default }
+}
+
+function Save-HelpdeskCsv {
+    # Saves rows to a timestamped CSV on the Desktop
+    param($Rows, [string]$BaseName)
+    $path = Join-Path ([Environment]::GetFolderPath('Desktop')) "$($BaseName)_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+    try {
+        $Rows | Export-Csv -Path $path -NoTypeInformation -ErrorAction Stop
+        Write-Host "Saved to: $path" -ForegroundColor Green
+    } catch {
+        Write-Host "Could not save CSV: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
 # ===========================================================================
 # User functions
 # ===========================================================================
@@ -945,6 +963,445 @@ function Show-HelpdeskFleetModelReport {
 }
 
 # ===========================================================================
+# Domain functions - Structure & inventory
+# ===========================================================================
+
+function Get-ParentDN {
+    # "CN=Smith\, John,OU=Sales,DC=..." -> "OU=Sales,DC=..."
+    param([string]$DN)
+    $DN -replace '^(?:\\,|[^,])+,', ''
+}
+
+function Show-DomainOuTree {
+    Write-Host "`nReading OU structure..." -ForegroundColor Cyan
+    try {
+        $domain    = Get-ADDomain -Server $script:DC -ErrorAction Stop
+        $ous       = @(Get-ADOrganizationalUnit -Filter * -Server $script:DC -ErrorAction Stop)
+        $users     = @(Get-ADUser -Filter * -Server $script:DC -ErrorAction Stop)
+        $computers = @(Get-ADComputer -Filter * -Server $script:DC -ErrorAction Stop)
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    # Count objects sitting directly inside each OU or container
+    $userCount = @{}
+    foreach ($u in $users) { $userCount[(Get-ParentDN $u.DistinguishedName)]++ }
+    $computerCount = @{}
+    foreach ($c in $computers) { $computerCount[(Get-ParentDN $c.DistinguishedName)]++ }
+
+    # Parent -> children map, including the default Users and Computers containers
+    $nodes = @($ous | ForEach-Object { [pscustomobject]@{ DN = $_.DistinguishedName; Name = $_.Name; IsContainer = $false } })
+    foreach ($dn in $domain.UsersContainer, $domain.ComputersContainer) {
+        $nodes += [pscustomobject]@{ DN = $dn; Name = Get-NameFromDN $dn; IsContainer = $true }
+    }
+    $children = @{}
+    foreach ($n in $nodes) {
+        $parent = Get-ParentDN $n.DN
+        if (-not $children.ContainsKey($parent)) { $children[$parent] = @() }
+        $children[$parent] += $n
+    }
+
+    function Write-OuBranch([string]$ParentDN, [int]$Depth) {
+        if (-not $children.ContainsKey($ParentDN)) { return }
+        foreach ($n in ($children[$ParentDN] | Sort-Object Name)) {
+            $u    = [int]$userCount[$n.DN]
+            $c    = [int]$computerCount[$n.DN]
+            $tag  = if ($n.IsContainer) { ' [default container]' } else { '' }
+            $line = '{0}{1}{2}  ({3} users, {4} computers)' -f ('    ' * $Depth), $n.Name, $tag, $u, $c
+            if (($u + $c -eq 0) -and -not $children.ContainsKey($n.DN)) {
+                Write-Host $line -ForegroundColor DarkGray
+            } else {
+                Write-Host $line
+            }
+            Write-OuBranch $n.DN ($Depth + 1)
+        }
+    }
+
+    Write-Host ""
+    Write-Host $domain.DNSRoot -ForegroundColor Cyan
+    Write-OuBranch $domain.DistinguishedName 1
+    Write-Host "`n$($ous.Count) OUs, $($users.Count) users, $($computers.Count) computers. Empty OUs are shown in gray."
+}
+
+function Show-DomainGroupMembers {
+    param($Group)
+
+    $recursive = Read-YesNo "Include members of nested groups?" -Default $false
+    try {
+        $members = @(Get-ADGroupMember -Identity $Group -Recursive:$recursive -Server $script:DC -ErrorAction Stop)
+    } catch {
+        Write-Host "Could not read members: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    if (-not $members.Count) {
+        Write-Host "`n$($Group.Name) has no members." -ForegroundColor Yellow
+        return
+    }
+
+    $rows = @($members | Sort-Object objectClass, name | ForEach-Object {
+        [pscustomobject]@{ Name = $_.name; Username = $_.SamAccountName; Type = $_.objectClass }
+    })
+
+    $scope = if ($recursive) { 'including nested groups' } else { 'direct members only' }
+    Write-Section "$($Group.Name): $($rows.Count) member(s), $scope"
+    $rows | Format-Table -AutoSize | Out-Host
+
+    if (Read-YesNo "Export to CSV?" -Default $false) {
+        Save-HelpdeskCsv $rows "GroupMembers_$($Group.Name -replace '[^\w-]', '_')"
+    }
+}
+
+function Show-DomainGroupDetails {
+    param($Group)
+
+    try {
+        $g = Get-ADGroup -Identity $Group -Server $script:DC -ErrorAction Stop -Properties `
+                Description, ManagedBy, mail, info, member, MemberOf, CanonicalName, whenCreated, whenChanged
+    } catch {
+        Write-Host "Could not read group: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    $ou = if ($g.CanonicalName) { $g.CanonicalName.Substring(0, $g.CanonicalName.LastIndexOf('/')) } else { '' }
+
+    Write-Section "Group: $($g.Name)"
+    Write-Row 'Name'               $g.Name
+    Write-Row 'Pre-2000 name'      $g.SamAccountName
+    Write-Row 'Type'               $g.GroupCategory
+    Write-Row 'Scope'              $g.GroupScope
+    Write-Row 'Description'        $g.Description
+    Write-Row 'Email'              $g.mail
+    Write-Row 'Managed by'         (& { if ($g.ManagedBy) { Get-NameFromDN $g.ManagedBy } })
+    Write-Row 'OU'                 $ou
+    Write-Row 'Created'            (Format-Date $g.whenCreated)
+    Write-Row 'Last modified'      (Format-Date $g.whenChanged)
+    Write-Row 'Direct members'     $g.member.Count
+    Write-Row 'Notes'              $g.info
+
+    $parents = @($g.MemberOf | ForEach-Object { Get-NameFromDN $_ } | Sort-Object)
+    Write-Section "Member of ($($parents.Count))"
+    if ($parents.Count) {
+        foreach ($p in $parents) { Write-Host "  $p" }
+    } else {
+        Write-Host "  (not a member of any group)"
+    }
+}
+
+function Show-DomainGroupBrowser {
+    $filter = (Read-Host "Filter groups by name (blank for all)").Trim()
+    try {
+        $groups = @(Get-ADGroup -Filter * -Properties member -Server $script:DC -ErrorAction Stop |
+                    Where-Object { -not $filter -or $_.Name -like "*$filter*" } |
+                    Sort-Object Name)
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    if (-not $groups.Count) {
+        Write-Host "No groups match '$filter'." -ForegroundColor Yellow
+        return
+    }
+
+    while ($true) {
+        Write-Host ""
+        Write-Host ("{0,5}  {1,-45} {2,-13} {3,-13} {4}" -f '#', 'Name', 'Type', 'Scope', 'Members') -ForegroundColor Cyan
+        for ($i = 0; $i -lt $groups.Count; $i++) {
+            $g = $groups[$i]
+            Write-Host ("{0,5}  {1,-45} {2,-13} {3,-13} {4}" -f ($i + 1), $g.Name, $g.GroupCategory, $g.GroupScope, $g.member.Count)
+        }
+
+        $pick = (Read-Host "`nSelect a group number (blank to go back)").Trim()
+        if (-not $pick) { return }
+        if ($pick -notmatch '^\d+$' -or [int]$pick -lt 1 -or [int]$pick -gt $groups.Count) {
+            Write-Host "Invalid selection." -ForegroundColor Yellow
+            continue
+        }
+        $group = $groups[[int]$pick - 1]
+
+        $backToList = $false
+        while (-not $backToList) {
+            Write-Host ""
+            Write-Host "=== Group: $($group.Name) ===" -ForegroundColor Cyan
+            Write-Host "  1) Members"
+            Write-Host "  2) Details"
+            Write-Host "  B) Back to group list"
+            switch (Read-Host "Choose an option") {
+                '1'     { Show-DomainGroupMembers $group }
+                '2'     { Show-DomainGroupDetails $group }
+                'b'     { $backToList = $true }
+                default { Write-Host "Invalid option." -ForegroundColor Yellow }
+            }
+        }
+    }
+}
+
+function Show-DomainStaleComputers {
+    $days   = Read-Days "Show computers with no logon in how many days?" 90
+    $cutoff = (Get-Date).AddDays(-$days)
+    $now    = Get-Date
+
+    try {
+        $computers = @(Get-ADComputer -Filter * -Server $script:DC -ErrorAction Stop `
+                        -Properties LastLogonDate, OperatingSystem, whenCreated, CanonicalName, Description)
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    # Never-logged-on computers sort first, then oldest logon; new objects are skipped
+    $rows = @($computers |
+        Where-Object { $_.whenCreated -lt $cutoff -and (-not $_.LastLogonDate -or $_.LastLogonDate -lt $cutoff) } |
+        Sort-Object LastLogonDate, Name |
+        ForEach-Object {
+            [pscustomobject]@{
+                Computer           = $_.Name
+                Enabled            = $_.Enabled
+                OS                 = $_.OperatingSystem
+                'Last Logon'       = if ($_.LastLogonDate) { Format-Date $_.LastLogonDate } else { 'Never' }
+                'Days Since Logon' = if ($_.LastLogonDate) { ($now - $_.LastLogonDate).Days } else { 'Never' }
+                OU                 = if ($_.CanonicalName) { $_.CanonicalName.Substring(0, $_.CanonicalName.LastIndexOf('/')) } else { '' }
+                Description        = $_.Description
+            }
+        })
+
+    if (-not $rows.Count) {
+        Write-Host "`nNo computers without a logon in the last $days days." -ForegroundColor Green
+        return
+    }
+
+    $enabled = @($rows | Where-Object { $_.Enabled }).Count
+    Write-Section "Stale computers: $($rows.Count) with no logon in $days+ days ($enabled still enabled)"
+    $rows | Format-Table -AutoSize Computer, Enabled, OS, 'Last Logon', 'Days Since Logon', OU | Out-Host
+
+    if (Read-YesNo "Export to CSV?" -Default $false) { Save-HelpdeskCsv $rows 'StaleComputers' }
+}
+
+# ===========================================================================
+# Domain functions - Security
+# ===========================================================================
+
+function Show-DomainPrivilegedAudit {
+    try {
+        $domainSid = (Get-ADDomain -Server $script:DC -ErrorAction Stop).DomainSID.Value
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    # Looked up by well-known SID so renamed groups are still found
+    $privileged = @(
+        "$domainSid-512",   # Domain Admins
+        "$domainSid-519",   # Enterprise Admins (forest root domain only)
+        "$domainSid-518",   # Schema Admins (forest root domain only)
+        'S-1-5-32-544',     # Administrators
+        'S-1-5-32-548',     # Account Operators
+        'S-1-5-32-549',     # Server Operators
+        'S-1-5-32-550',     # Print Operators
+        'S-1-5-32-551',     # Backup Operators
+        "$domainSid-520"    # Group Policy Creator Owners
+    )
+
+    $staleCutoff = (Get-Date).AddDays(-90)
+    $allRows = @()
+
+    foreach ($sid in $privileged) {
+        try {
+            $group = Get-ADGroup -Identity $sid -Server $script:DC -ErrorAction Stop
+        } catch {
+            continue
+        }
+
+        try {
+            $direct  = @(Get-ADGroupMember -Identity $group -Server $script:DC -ErrorAction Stop).distinguishedName
+            $members = @(Get-ADGroupMember -Identity $group -Recursive -Server $script:DC -ErrorAction Stop)
+        } catch {
+            Write-Host "`nCould not read members of $($group.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        $groupRows = @(foreach ($m in $members | Sort-Object name) {
+            $u = $null
+            if ($m.objectClass -eq 'user') {
+                $u = Get-ADUser -Identity $m.distinguishedName -Server $script:DC `
+                        -Properties LastLogonDate, PasswordLastSet, PasswordNeverExpires -ErrorAction SilentlyContinue
+            }
+
+            $flags = @()
+            if ($u) {
+                if (-not $u.Enabled)            { $flags += 'Disabled' }
+                if ($u.PasswordNeverExpires)    { $flags += 'Password never expires' }
+                if (-not $u.LastLogonDate -or $u.LastLogonDate -lt $staleCutoff) { $flags += 'No logon 90+ days' }
+            }
+
+            [pscustomobject]@{
+                Group               = $group.Name
+                Name                = $m.name
+                Username            = $m.SamAccountName
+                Type                = $m.objectClass
+                Membership          = if ($direct -contains $m.distinguishedName) { 'Direct' } else { 'Nested' }
+                Enabled             = if ($u) { $u.Enabled } else { '' }
+                'Last Logon'        = if ($u) { Format-Date $u.LastLogonDate } else { '' }
+                'Password Last Set' = if ($u) { Format-Date $u.PasswordLastSet } else { '' }
+                Flags               = $flags -join '; '
+            }
+        })
+
+        Write-Section "$($group.Name) ($($groupRows.Count))"
+        if ($groupRows.Count) {
+            $groupRows | Format-Table -AutoSize Name, Username, Type, Membership, Enabled, 'Last Logon', Flags | Out-Host
+        } else {
+            Write-Host "  (no members)"
+        }
+        $allRows += $groupRows
+    }
+
+    $userRows = @($allRows | Where-Object { $_.Type -eq 'user' })
+    $unique   = @($userRows.Username | Sort-Object -Unique)
+    $flagged  = @($userRows | Where-Object { $_.Flags } | ForEach-Object { $_.Username } | Sort-Object -Unique)
+
+    Write-Host ""
+    Write-Row 'Privileged accounts' $unique.Count
+    Write-Row 'Accounts with flags' $flagged.Count (& { if ($flagged.Count) { 'Yellow' } })
+
+    if ($allRows.Count -and (Read-YesNo "Export to CSV?" -Default $false)) { Save-HelpdeskCsv $allRows 'PrivilegedGroups' }
+}
+
+function Show-DomainLockouts {
+    Write-Host "`nReading lockout events (4740) from $($script:DC)..." -ForegroundColor Cyan
+    try {
+        $events = @(Get-WinEvent -ComputerName $script:DC -ErrorAction Stop -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4740
+            StartTime = (Get-Date).AddHours(-24)
+        })
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+            Write-Host "No lockouts in the last 24 hours." -ForegroundColor Green
+        } else {
+            Write-Host "Could not read the Security log on $($script:DC): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "This requires admin rights or membership in Event Log Readers on the DC." -ForegroundColor Red
+        }
+        return
+    }
+
+    # Event 4740: property 0 = locked account, property 1 = computer the bad attempts came from
+    $rows = @($events | ForEach-Object {
+        [pscustomobject]@{
+            Time              = $_.TimeCreated.ToString('dd-MMM-yyyy hh:mm:ss tt')
+            User              = $_.Properties[0].Value
+            'Source Computer' = if ($_.Properties[1].Value) { $_.Properties[1].Value } else { '(not reported)' }
+        }
+    })
+
+    Write-Section "Lockouts in the last 24 hours ($($rows.Count))"
+    $rows | Format-Table -AutoSize | Out-Host
+
+    Write-Section 'By user'
+    $rows | Group-Object User | Sort-Object Count -Descending | ForEach-Object {
+        [pscustomobject]@{
+            User     = $_.Name
+            Lockouts = $_.Count
+            Sources  = ($_.Group.'Source Computer' | Sort-Object -Unique) -join ', '
+        }
+    } | Format-Table -AutoSize | Out-Host
+}
+
+function Format-PolicySpan {
+    param($Span, [string]$Unit, [string]$ZeroText)
+    if (-not $Span -or $Span.Ticks -eq 0 -or $Span.TotalDays -gt 36500) { return $ZeroText }
+    if ($Unit -eq 'days') { "$([math]::Round($Span.TotalDays)) days" } else { "$([math]::Round($Span.TotalMinutes)) minutes" }
+}
+
+function Write-PolicyRows {
+    param($Policy)
+    Write-Row 'Minimum length'         "$($Policy.MinPasswordLength) characters"
+    Write-Row 'Complexity required'    $Policy.ComplexityEnabled
+    Write-Row 'Password history'       "$($Policy.PasswordHistoryCount) passwords remembered"
+    Write-Row 'Maximum age'            (Format-PolicySpan $Policy.MaxPasswordAge 'days' 'Never expires')
+    Write-Row 'Minimum age'            (Format-PolicySpan $Policy.MinPasswordAge 'days' 'None')
+    Write-Row 'Lockout threshold'      (& { if ($Policy.LockoutThreshold) { "$($Policy.LockoutThreshold) bad attempts" } else { 'Lockout disabled' } })
+    Write-Row 'Lockout duration'       (Format-PolicySpan $Policy.LockoutDuration 'minutes' 'Until an admin unlocks')
+    Write-Row 'Lockout counter reset'  (Format-PolicySpan $Policy.LockoutObservationWindow 'minutes' '-')
+    Write-Row 'Reversible encryption'  $Policy.ReversibleEncryptionEnabled
+}
+
+function Show-DomainPasswordPolicies {
+    try {
+        $default = Get-ADDefaultDomainPasswordPolicy -Server $script:DC -ErrorAction Stop
+        Write-Section 'Default domain policy'
+        Write-PolicyRows $default
+    } catch {
+        Write-Host "Could not read the default policy: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    try {
+        $fgpps = @(Get-ADFineGrainedPasswordPolicy -Filter * -Server $script:DC -ErrorAction Stop | Sort-Object Precedence)
+    } catch {
+        Write-Host "`nCould not read fine-grained policies (needs admin rights): $($_.Exception.Message)" -ForegroundColor Yellow
+        return
+    }
+
+    if (-not $fgpps.Count) {
+        Write-Host "`nNo fine-grained password policies are defined." -ForegroundColor Green
+        return
+    }
+
+    foreach ($p in $fgpps) {
+        Write-Section "Fine-grained policy: $($p.Name) (precedence $($p.Precedence))"
+        $appliesTo = @($p.AppliesTo | ForEach-Object { Get-NameFromDN $_ })
+        Write-Row 'Applies to' (& { if ($appliesTo.Count) { $appliesTo -join ', ' } else { '(nobody)' } })
+        Write-PolicyRows $p
+    }
+    Write-Host "`nWhen several policies apply to a user, the lowest precedence number wins." -ForegroundColor DarkGray
+}
+
+function Show-DomainExpiringPasswords {
+    $days  = Read-Days "Show passwords expiring within how many days?" 14
+    $now   = Get-Date
+    $limit = $now.AddDays($days)
+
+    try {
+        $users = @(Get-ADUser -Filter 'Enabled -eq $true -and PasswordNeverExpires -eq $false' -Server $script:DC `
+                    -Properties DisplayName, Mail, 'msDS-UserPasswordExpiryTimeComputed' -ErrorAction Stop)
+    } catch {
+        Write-Host "AD query failed: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    $alreadyExpired = 0
+    $rows = @(foreach ($u in $users) {
+        $raw = $u.'msDS-UserPasswordExpiryTimeComputed'
+        if (-not $raw -or $raw -eq 9223372036854775807) { continue }   # must change at logon, or never expires
+        $expires = [datetime]::FromFileTime($raw)
+        if ($expires -lt $now) { $alreadyExpired++; continue }
+        if ($expires -gt $limit) { continue }
+
+        [pscustomobject]@{
+            Name        = $u.DisplayName
+            Username    = $u.SamAccountName
+            Email       = $u.Mail
+            Expires     = Format-Date $expires
+            'Days Left' = [math]::Floor(($expires - $now).TotalDays)
+        }
+    })
+
+    if ($rows.Count) {
+        Write-Section "Passwords expiring in the next $days days ($($rows.Count))"
+        $rows | Sort-Object 'Days Left', Name | Format-Table -AutoSize | Out-Host
+    } else {
+        Write-Host "`nNo passwords expire in the next $days days." -ForegroundColor Green
+    }
+    if ($alreadyExpired) {
+        Write-Host "$alreadyExpired enabled user(s) already have an expired password." -ForegroundColor Yellow
+    }
+
+    if ($rows.Count -and (Read-YesNo "Export to CSV?" -Default $false)) {
+        Save-HelpdeskCsv ($rows | Sort-Object 'Days Left', Name) 'ExpiringPasswords'
+    }
+}
+
+# ===========================================================================
 # Menus
 # ===========================================================================
 
@@ -1053,6 +1510,60 @@ function Show-MachineMenu {
     }
 }
 
+function Show-DomainStructureMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "=== Domain > Structure & Inventory ===" -ForegroundColor Cyan
+        Write-Host "  1) OU tree"
+        Write-Host "  2) Groups"
+        Write-Host "  3) Stale computer objects"
+        Write-Host "  B) Back"
+        switch (Read-Host "Choose an option") {
+            '1'     { Show-DomainOuTree }
+            '2'     { Show-DomainGroupBrowser }
+            '3'     { Show-DomainStaleComputers }
+            'b'     { return }
+            default { Write-Host "Invalid option." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-DomainSecurityMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "=== Domain > Security ===" -ForegroundColor Cyan
+        Write-Host "  1) Privileged group audit"
+        Write-Host "  2) Lockouts (last 24 hours)"
+        Write-Host "  3) Password policies"
+        Write-Host "  4) Passwords expiring soon"
+        Write-Host "  B) Back"
+        switch (Read-Host "Choose an option") {
+            '1'     { Show-DomainPrivilegedAudit }
+            '2'     { Show-DomainLockouts }
+            '3'     { Show-DomainPasswordPolicies }
+            '4'     { Show-DomainExpiringPasswords }
+            'b'     { return }
+            default { Write-Host "Invalid option." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-DomainMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "=== Domain Functions ===" -ForegroundColor Cyan
+        Write-Host "  1) Structure & inventory"
+        Write-Host "  2) Security"
+        Write-Host "  B) Back"
+        switch (Read-Host "Choose an option") {
+            '1'     { Show-DomainStructureMenu }
+            '2'     { Show-DomainSecurityMenu }
+            'b'     { return }
+            default { Write-Host "Invalid option." -ForegroundColor Yellow }
+        }
+    }
+}
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -1072,12 +1583,14 @@ while ($true) {
     Write-Host "=== Helpdesk Multitool ===" -ForegroundColor Cyan
     Write-Host "  1) User functions"
     Write-Host "  2) Machine functions"
+    Write-Host "  3) Domain functions"
     Write-Host "  Q) Quit"
     $selection = Read-Host "Choose an option"
 
     switch ($selection) {
         '1' { Show-UserMenu }
         '2' { Show-MachineMenu }
+        '3' { Show-DomainMenu }
         'q' { return }
         default { Write-Host "Invalid option." -ForegroundColor Yellow }
     }
